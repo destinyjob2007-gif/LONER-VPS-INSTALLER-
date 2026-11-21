@@ -34,8 +34,6 @@ Copy one line, paste it, press Enter:
 curl -fsSL https://raw.githubusercontent.com/destinyjob2007-gif/LONER-VPS-INSTALLER/main/ptero-install.sh -o ptero-install.sh && bash ptero-install.sh
 ```
 
-Replace `YOUR_GITHUB_NAME` and `YOUR_REPO_NAME` with this repo's names.
-
 If `curl` is missing: `apt update && apt install -y curl`, then try again.
 
 ## 3. Follow the screen
