@@ -1,4 +1,3 @@
-
 set -u
 export DEBIAN_FRONTEND=noninteractive
 export COMPOSER_ALLOW_SUPERUSER=1
@@ -56,8 +55,37 @@ else
   ask() { local v; read -r -p "$1" v </dev/tty; echo "$v"; }
   echo "Answer a few questions. Nothing is sent anywhere."
   echo
-  echo "This installer needs a free ngrok account: it gives your panel a"
-  echo "public https address, so you do not need to buy a domain."
+  echo "How will people reach your panel?"
+  echo "  1) ngrok  - free, no domain needed (best for beginners)"
+  echo "  2) My own domain - you own a domain (like panel.example.com) and this"
+  echo "     VPS has a public IP with ports 80 and 443 open"
+  MODE_ANS=$(ask "Choose 1 or 2 [1]: ")
+  if [ "$MODE_ANS" = 2 ]; then MODE=domain; else MODE=ngrok; fi
+  NGROK_TOKEN=""
+  if [ "$MODE" = domain ]; then
+    banner
+    VPS_IP=$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    echo "  OWN DOMAIN SETUP. Before you continue, do this at your domain provider"
+    echo "  (Namecheap, GoDaddy, Cloudflare, etc.):"
+    echo "    1. Add a DNS record:  Type A   Name: panel (or any name you like)"
+    echo "       Value: ${VPS_IP:-your VPS IP}"
+    echo "    2. If you use Cloudflare, set the record to DNS only (grey cloud)."
+    echo "    3. In your VPS provider's firewall, open ports 80 and 443."
+    echo "    4. Wait a few minutes for DNS to update."
+    pause
+    PANEL_DOMAIN=$(ask "Your full panel domain (e.g. panel.example.com): ")
+    PANEL_DOMAIN=${PANEL_DOMAIN#https://}; PANEL_DOMAIN=${PANEL_DOMAIN#http://}; PANEL_DOMAIN=${PANEL_DOMAIN%%/*}
+    DOM_IP=$(getent hosts "$PANEL_DOMAIN" | awk '{print $1; exit}')
+    if [ -z "$DOM_IP" ] || { [ -n "$VPS_IP" ] && [ "$DOM_IP" != "$VPS_IP" ]; }; then
+      warn "$PANEL_DOMAIN points to '${DOM_IP:-nothing yet}' but this VPS is '${VPS_IP:-unknown}'."
+      warn "The free HTTPS certificate will fail until DNS matches. Fix DNS, wait, then run this script again."
+      exit 1
+    fi
+    echo "  DNS looks good: $PANEL_DOMAIN -> $DOM_IP"
+  else
+  echo
+  echo "ngrok gives your panel a free public https address, so you do not"
+  echo "need to buy a domain."
   have=$(ask "Do you already have an ngrok domain and authtoken? [y/N]: ")
   if [[ ! "$have" =~ ^[Yy] ]]; then
     banner
@@ -86,6 +114,7 @@ else
   PANEL_DOMAIN=$(ask "Panel ngrok domain (e.g. name.ngrok-free.dev): ")
   PANEL_DOMAIN=${PANEL_DOMAIN#https://}; PANEL_DOMAIN=${PANEL_DOMAIN#http://}; PANEL_DOMAIN=${PANEL_DOMAIN%%/*}
   read -r -s -p "ngrok authtoken (hidden): " NGROK_TOKEN </dev/tty; echo
+  fi
   ADMIN_EMAIL=$(ask "Admin email: ")
   ADMIN_USER=$(ask "Admin username: ")
   while true; do
@@ -103,6 +132,7 @@ else
   DB_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
   umask 077
   cat > "$CONF" <<EOF
+MODE='$MODE'
 PANEL_DOMAIN='$PANEL_DOMAIN'
 NGROK_TOKEN='$NGROK_TOKEN'
 ADMIN_EMAIL='$ADMIN_EMAIL'
@@ -114,7 +144,9 @@ DB_PASS='$DB_PASS'
 EOF
   umask 022
 fi
-[ -n "${PANEL_DOMAIN:-}" ] && [ -n "${NGROK_TOKEN:-}" ] || die "Saved answers are incomplete. Delete $CONF and run again."
+MODE=${MODE:-ngrok}
+[ -n "${PANEL_DOMAIN:-}" ] || die "Saved answers are incomplete. Delete $CONF and run again."
+[ "$MODE" = domain ] || [ -n "${NGROK_TOKEN:-}" ] || die "Saved answers are incomplete. Delete $CONF and run again."
 PANEL_URL="https://$PANEL_DOMAIN"
 PANEL=/var/www/pterodactyl
 NGROK_CFG="$DATA/conf/ngrok.yml"
@@ -127,6 +159,9 @@ if ! dpkg -s php8.3-fpm mariadb-server nginx redis-server >/dev/null 2>&1; then
   LC_ALL=C.UTF-8 run add-apt-repository -y ppa:ondrej/php || die "could not add the PHP repository"
   run apt-get update
   run apt-get -y install php8.3 php8.3-cli php8.3-fpm php8.3-common php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-curl php8.3-zip php8.3-gd php8.3-intl mariadb-server nginx redis-server || die "PHP/MariaDB/nginx/redis install failed"
+fi
+if [ "$MODE" = domain ] && ! command -v certbot >/dev/null; then
+  run apt-get -y install certbot || die "could not install certbot"
 fi
 if ! command -v composer >/dev/null; then
   curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer >>"$LOG" 2>&1 || die "composer install failed"
@@ -219,10 +254,7 @@ fi
 # ---------- 7. nginx, cron, queue ---------------------------------------------
 say "7/10 Web server and background workers"
 rm -f /etc/nginx/sites-enabled/default
-cat > /etc/nginx/sites-available/pterodactyl.conf <<'EOF'
-server {
-    listen 80 default_server;
-    server_name _;
+IFS= read -r -d '' NGBODY <<'EOF'
     root /var/www/pterodactyl/public;
     index index.php;
     client_max_body_size 100m;
@@ -253,8 +285,38 @@ server {
     location ~ /\.ht {
         deny all;
     }
+EOF
+if [ "$MODE" = domain ]; then
+  CERT=/etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem
+  if [ ! -f "$CERT" ]; then
+    say "Getting a free HTTPS certificate for $PANEL_DOMAIN"
+    service nginx stop >>"$LOG" 2>&1
+    certbot certonly --standalone -d "$PANEL_DOMAIN" --agree-tos -m "$ADMIN_EMAIL" -n >>"$LOG" 2>&1 \
+      || die "certificate failed. Check that $PANEL_DOMAIN points to this VPS and ports 80 and 443 are open"
+  fi
+  cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl default_server;
+    server_name $PANEL_DOMAIN;
+    ssl_certificate /etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$PANEL_DOMAIN/privkey.pem;
+$NGBODY
 }
 EOF
+else
+  cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+$NGBODY
+}
+EOF
+fi
 ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
 nginx -t >>"$LOG" 2>&1 || die "nginx config test failed"
 service nginx restart >>"$LOG" 2>&1 || service nginx start >>"$LOG" 2>&1
@@ -262,6 +324,7 @@ service nginx restart >>"$LOG" 2>&1 || service nginx start >>"$LOG" 2>&1
 cat > "$DATA/ptero-cron.sh" <<'EOF'
 while true; do
   runuser -u www-data -- php /var/www/pterodactyl/artisan schedule:run > /dev/null 2>&1
+  [ "$(date +%H%M)" = 0330 ] && command -v certbot >/dev/null && certbot renew -q --pre-hook "service nginx stop" --post-hook "service nginx start" >/dev/null 2>&1
   sleep 60
 done
 EOF
@@ -303,12 +366,16 @@ grep -q '^api:' /etc/pterodactyl/config.yml || die "Wings config looks wrong (se
 sed -i '/^api:/,/^[a-z]/ s/^\( *port: *\)[0-9]\+/\18080/' /etc/pterodactyl/config.yml
 
 # ---------- 10. ngrok ---------------------------------------------------------
+if [ "$MODE" = ngrok ]; then
 say "10/10 ngrok"
 if ! command -v ngrok >/dev/null; then
   curl -fL -o /root/ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz >>"$LOG" 2>&1 || die "could not download ngrok"
   tar -xzf /root/ngrok.tgz -C /usr/local/bin && rm -f /root/ngrok.tgz
 fi
 ngrok config add-authtoken "$NGROK_TOKEN" --config "$NGROK_CFG" >>"$LOG" 2>&1 || die "ngrok token was rejected"
+else
+say "10/10 (skipped: you use your own domain, no ngrok needed)"
+fi
 
 # ---------- start script (use after every restart) ----------------------------
 START="$DATA/start-ptero.sh"
@@ -319,7 +386,7 @@ mkdir -p /run/mysqld /run/php; chown mysql:mysql /run/mysqld
 service mariadb start; service redis-server start; service php8.3-fpm start; service nginx start
 pgrep -f ptero-cron.sh >/dev/null || nohup bash $DATA/ptero-cron.sh >/dev/null 2>&1 &
 pgrep -f 'queue:work' >/dev/null || nohup runuser -u www-data -- php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3 >/var/log/pteroq.log 2>&1 &
-pgrep -x ngrok >/dev/null || nohup ngrok http 80 --log=stdout --config $NGROK_CFG --url=$PANEL_DOMAIN >/var/log/ngrok.log 2>&1 &
+[ "$MODE" = ngrok ] && { pgrep -x ngrok >/dev/null || nohup ngrok http 80 --log=stdout --config $NGROK_CFG --url=$PANEL_DOMAIN >/var/log/ngrok.log 2>&1 & }
 pgrep -x dockerd >/dev/null || nohup dockerd --data-root=$DATA/docker >/var/log/dockerd.log 2>&1 &
 for i in \$(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 1; done
 for i in \$(seq 1 60); do curl -sf -o /dev/null $PANEL_URL/auth/login && break; sleep 2; done
@@ -332,10 +399,12 @@ for i in $(seq 1 30); do [ "$(curl -s -o /dev/null -w %{http_code} http://127.0.
 # ---------- checks -------------------------------------------------------------
 say "Checking"
 OK=1
-c1=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/auth/login); [ "$c1" = 200 ] && echo "panel (local):  OK" || { echo "panel (local):  FAIL ($c1)"; OK=0; }
+c1=$(curl -s -o /dev/null -w '%{http_code}' "$PANEL_URL/auth/login"); [ "$c1" = 200 ] && echo "panel:           OK" || { echo "panel:           FAIL ($c1)"; OK=0; }
 c2=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/system); [ "$c2" = 401 ] && echo "wings (local):  OK" || { echo "wings (local):  FAIL ($c2)"; OK=0; }
-curl -s localhost:4040/api/tunnels | grep -q "$PANEL_DOMAIN" && echo "ngrok tunnel:   OK" || { echo "ngrok tunnel:   FAIL (see /var/log/ngrok.log)"; OK=0; }
-c3=$(curl -s -o /dev/null -w '%{http_code}' "$PANEL_URL/api/system"); [ "$c3" = 401 ] && echo "wings via ngrok: OK" || { echo "wings via ngrok: unexpected ($c3) - wait a minute and check the node heart"; }
+if [ "$MODE" = ngrok ]; then
+  curl -s localhost:4040/api/tunnels | grep -q "$PANEL_DOMAIN" && echo "ngrok tunnel:   OK" || { echo "ngrok tunnel:   FAIL (see /var/log/ngrok.log)"; OK=0; }
+fi
+c3=$(curl -s -o /dev/null -w '%{http_code}' "$PANEL_URL/api/system"); [ "$c3" = 401 ] && echo "wings via domain: OK" || { echo "wings via domain: unexpected ($c3) - wait a minute and check the node heart"; }
 
 cat <<EOF
 
