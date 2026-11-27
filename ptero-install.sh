@@ -37,10 +37,17 @@ pause() { read -r -p "  Press Enter when done... " _ </dev/tty; }
 
 [ "$(id -u)" = 0 ] || die "Run as root."
 . /etc/os-release
-case "${VERSION_ID:-}" in 22.04|24.04) ;; *) warn "Tested on Ubuntu 22.04/24.04 only (you have ${PRETTY_NAME:-unknown}). Continuing anyway." ;; esac
+case "${ID:-}" in ubuntu|debian) ;; *) die "This installer supports Ubuntu and Debian only (you have ${PRETTY_NAME:-unknown})." ;; esac
+case "${ID}-${VERSION_ID:-}" in ubuntu-22.04|ubuntu-24.04|debian-11|debian-12|debian-13) ;; *) warn "Tested on Ubuntu 22.04/24.04 and Debian 11/12/13 (you have ${PRETTY_NAME:-unknown}). Continuing anyway." ;; esac
+PHPV=8.3
+SYSTEMD=0
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && SYSTEMD=1
 
 # ---------- where to keep data -------------------------------------------------
-if mountpoint -q /data 2>/dev/null; then DATA=/data; else DATA=/var/lib/ptero-data; fi
+# Normal servers (systemd) keep everything in the usual places. Only no-systemd VMs link folders into /data.
+if [ "$SYSTEMD" = 1 ]; then DATA=/var/lib/ptero-data
+elif mountpoint -q /data 2>/dev/null; then DATA=/data
+else DATA=/var/lib/ptero-data; fi
 mkdir -p "$DATA"/{conf,docker,www,mysql,pterodactyl,.ptero-install}
 STATE="$DATA/.ptero-install"
 CONF="$STATE/config.env"
@@ -153,12 +160,21 @@ NGROK_CFG="$DATA/conf/ngrok.yml"
 
 # ---------- 1. packages --------------------------------------------------------
 say "1/10 Installing system packages (a few minutes)"
-if ! dpkg -s php8.3-fpm mariadb-server nginx redis-server >/dev/null 2>&1; then
+if ! dpkg -s php$PHPV-fpm mariadb-server nginx redis-server >/dev/null 2>&1; then
   run apt-get update || die "apt update failed"
-  run apt-get -y install apt-utils software-properties-common curl ca-certificates gnupg lsb-release tar unzip git procps python3 || die "base packages failed"
-  LC_ALL=C.UTF-8 run add-apt-repository -y ppa:ondrej/php || die "could not add the PHP repository"
+  run apt-get -y install apt-utils curl ca-certificates gnupg lsb-release tar unzip git procps python3 || die "base packages failed"
+  if [ "$ID" = ubuntu ]; then
+    run apt-get -y install software-properties-common || die "base packages failed"
+    LC_ALL=C.UTF-8 run add-apt-repository -y ppa:ondrej/php || die "could not add the PHP repository"
+  else
+    # Debian does not carry PHP 8.3, so use the Sury repository
+    run apt-get -y install apt-transport-https || die "base packages failed"
+    curl -fsSL -o /tmp/sury-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb >>"$LOG" 2>&1 || die "could not download the PHP repository key"
+    dpkg -i /tmp/sury-keyring.deb >>"$LOG" 2>&1 || die "could not install the PHP repository key"
+    echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/sury-php.list
+  fi
   run apt-get update
-  run apt-get -y install php8.3 php8.3-cli php8.3-fpm php8.3-common php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-curl php8.3-zip php8.3-gd php8.3-intl mariadb-server nginx redis-server || die "PHP/MariaDB/nginx/redis install failed"
+  run apt-get -y install php$PHPV php$PHPV-cli php$PHPV-fpm php$PHPV-common php$PHPV-mysql php$PHPV-mbstring php$PHPV-bcmath php$PHPV-xml php$PHPV-curl php$PHPV-zip php$PHPV-gd php$PHPV-intl mariadb-server nginx redis-server || die "PHP/MariaDB/nginx/redis install failed"
 fi
 if [ "$MODE" = domain ] && ! command -v certbot >/dev/null; then
   run apt-get -y install certbot || die "could not install certbot"
@@ -178,18 +194,23 @@ link_dir() {  # link_dir <real location> <expected path>
     rm -rf "$path" 2>/dev/null; mkdir -p "$(dirname "$path")"; ln -sfn "$real" "$path"
   fi
 }
-service mariadb stop >>"$LOG" 2>&1 || true
-link_dir "$DATA/mysql" /var/lib/mysql
-link_dir "$DATA/www/pterodactyl" "$PANEL"
-link_dir "$DATA/conf/pterodactyl" /etc/pterodactyl
-link_dir "$DATA/pterodactyl" /var/lib/pterodactyl
-chown -R mysql:mysql "$DATA/mysql" 2>/dev/null || true
+if [ "$SYSTEMD" = 1 ]; then
+  say "   (normal server: data stays in the usual folders)"
+  mkdir -p "$PANEL" /etc/pterodactyl /var/lib/pterodactyl
+else
+  service mariadb stop >>"$LOG" 2>&1 || true
+  link_dir "$DATA/mysql" /var/lib/mysql
+  link_dir "$DATA/www/pterodactyl" "$PANEL"
+  link_dir "$DATA/conf/pterodactyl" /etc/pterodactyl
+  link_dir "$DATA/pterodactyl" /var/lib/pterodactyl
+  chown -R mysql:mysql "$DATA/mysql" 2>/dev/null || true
+fi
 
 # ---------- 3. start base services --------------------------------------------
 say "3/10 Starting MariaDB, Redis, PHP"
 mkdir -p /run/mysqld /run/php; chown mysql:mysql /run/mysqld
-if [ -z "$(ls -A "$DATA/mysql" 2>/dev/null)" ]; then mysql_install_db --user=mysql --datadir="$DATA/mysql" >>"$LOG" 2>&1 || true; fi
-service mariadb start >>"$LOG" 2>&1; service redis-server start >>"$LOG" 2>&1; service php8.3-fpm start >>"$LOG" 2>&1
+if [ "$SYSTEMD" = 0 ] && [ -z "$(ls -A "$DATA/mysql" 2>/dev/null)" ]; then mysql_install_db --user=mysql --datadir="$DATA/mysql" >>"$LOG" 2>&1 || true; fi
+service mariadb start >>"$LOG" 2>&1; service redis-server start >>"$LOG" 2>&1; service php$PHPV-fpm start >>"$LOG" 2>&1
 for i in $(seq 1 30); do mysql -u root -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
 mysql -u root -e 'SELECT 1' >/dev/null 2>&1 || die "MariaDB did not start"
 
@@ -228,7 +249,7 @@ if [ ! -f "$STATE/panel.done" ]; then
   php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" --name-first=Admin --name-last=User --password="$ADMIN_PASS" --admin=1 >>"$LOG" 2>&1 || die "could not create the admin user"
   touch "$STATE/panel.done"
 fi
-chown -R www-data:www-data "$DATA/www/pterodactyl"
+chown -R www-data:www-data "$PANEL/"
 
 if [ ! -f "$STATE/node.done" ]; then
   php artisan p:location:make --short=NG --long=Nigeria >>"$LOG" 2>&1 || warn "location may already exist"
@@ -286,6 +307,7 @@ IFS= read -r -d '' NGBODY <<'EOF'
         deny all;
     }
 EOF
+NGBODY=${NGBODY//php8.3-fpm.sock/php$PHPV-fpm.sock}
 if [ "$MODE" = domain ]; then
   CERT=/etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem
   if [ ! -f "$CERT" ]; then
@@ -341,15 +363,21 @@ if ! command -v docker >/dev/null; then
   run dpkg --configure -a
 fi
 command -v docker >/dev/null || die "Docker did not install"
-if [ "$FRESH_DOCKER" = 1 ]; then
-  service docker stop >>"$LOG" 2>&1 || true
-  pkill dockerd 2>/dev/null; pkill containerd 2>/dev/null; sleep 3
-fi
-if ! docker info >/dev/null 2>&1; then
-  nohup dockerd --data-root="$DATA/docker" >/var/log/dockerd.log 2>&1 &
+if [ "$SYSTEMD" = 1 ]; then
+  # normal server: Docker runs as a system service and starts by itself after a reboot
+  systemctl enable --now docker >>"$LOG" 2>&1 || true
   for i in $(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 1; done
+else
+  if [ "$FRESH_DOCKER" = 1 ]; then
+    service docker stop >>"$LOG" 2>&1 || true
+    pkill dockerd 2>/dev/null; pkill containerd 2>/dev/null; sleep 3
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    nohup dockerd --data-root="$DATA/docker" >/var/log/dockerd.log 2>&1 &
+    for i in $(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 1; done
+  fi
 fi
-docker info >/dev/null 2>&1 || die "Docker daemon did not start (see /var/log/dockerd.log)"
+docker info >/dev/null 2>&1 || die "Docker daemon did not start (see /var/log/dockerd.log or: journalctl -u docker)"
 docker run --rm hello-world >>"$LOG" 2>&1 || die "Docker cannot run containers (see $LOG)"
 
 # ---------- 9. Wings ----------------------------------------------------------
@@ -377,13 +405,95 @@ else
 say "10/10 (skipped: you use your own domain, no ngrok needed)"
 fi
 
-# ---------- start script (use after every restart) ----------------------------
+# ---------- start everything ---------------------------------------------------
 START="$DATA/start-ptero.sh"
-cat > "$START" <<EOF
+if [ "$SYSTEMD" = 1 ]; then
+  # Normal server: systemd starts everything by itself at boot and restarts it if it stops.
+  cat > /etc/systemd/system/pteroq.service <<EOF
+[Unit]
+Description=Pterodactyl Queue Worker
+After=redis-server.service mariadb.service
+
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > /etc/systemd/system/ptero-schedule.service <<EOF
+[Unit]
+Description=Pterodactyl scheduled tasks
+
+[Service]
+Type=oneshot
+User=www-data
+ExecStart=/usr/bin/php /var/www/pterodactyl/artisan schedule:run
+EOF
+  cat > /etc/systemd/system/ptero-schedule.timer <<EOF
+[Unit]
+Description=Run Pterodactyl scheduled tasks every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+  cat > /etc/systemd/system/wings.service <<EOF
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service nginx.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [ "$MODE" = domain ]; then
+    # free certificate renewal: certbot's own timer runs it, nginx is stopped for a moment while it does
+    mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
+    printf '#!/bin/sh\nsystemctl stop nginx\n' > /etc/letsencrypt/renewal-hooks/pre/ptero.sh
+    printf '#!/bin/sh\nsystemctl start nginx\n' > /etc/letsencrypt/renewal-hooks/post/ptero.sh
+    chmod +x /etc/letsencrypt/renewal-hooks/pre/ptero.sh /etc/letsencrypt/renewal-hooks/post/ptero.sh
+    systemctl enable --now certbot.timer >>"$LOG" 2>&1 || true
+  fi
+  systemctl daemon-reload
+  systemctl enable --now mariadb redis-server php$PHPV-fpm nginx >>"$LOG" 2>&1
+  systemctl enable --now pteroq.service ptero-schedule.timer >>"$LOG" 2>&1
+  systemctl enable wings.service >>"$LOG" 2>&1
+  [ "$MODE" = ngrok ] && warn "ngrok mode on a normal server: start ngrok yourself (ngrok http 80 --url=$PANEL_DOMAIN) or use the own-domain option."
+  # Wings needs the panel to answer first
+  for i in $(seq 1 60); do curl -sf -o /dev/null $PANEL_URL/auth/login && break; sleep 2; done
+  systemctl restart wings.service >>"$LOG" 2>&1
+  cat > "$START" <<EOF
+#!/usr/bin/env bash
+# Everything starts by itself at boot. This only restarts it by hand if you ever need to.
+systemctl restart mariadb redis-server php$PHPV-fpm nginx pteroq wings
+EOF
+else
+  cat > "$START" <<EOF
 #!/usr/bin/env bash
 # Starts everything. Safe to run more than once.
 mkdir -p /run/mysqld /run/php; chown mysql:mysql /run/mysqld
-service mariadb start; service redis-server start; service php8.3-fpm start; service nginx start
+service mariadb start; service redis-server start; service php$PHPV-fpm start; service nginx start
 pgrep -f ptero-cron.sh >/dev/null || nohup bash $DATA/ptero-cron.sh >/dev/null 2>&1 &
 pgrep -f 'queue:work' >/dev/null || nohup runuser -u www-data -- php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3 >/var/log/pteroq.log 2>&1 &
 [ "$MODE" = ngrok ] && { pgrep -x ngrok >/dev/null || nohup ngrok http 80 --log=stdout --config $NGROK_CFG --url=$PANEL_DOMAIN >/var/log/ngrok.log 2>&1 & }
@@ -392,8 +502,10 @@ for i in \$(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 1; done
 for i in \$(seq 1 60); do curl -sf -o /dev/null $PANEL_URL/auth/login && break; sleep 2; done
 pgrep -x wings >/dev/null || nohup wings >/var/log/wings.log 2>&1 &
 EOF
+  chmod +x "$START"
+  bash "$START" >>"$LOG" 2>&1
+fi
 chmod +x "$START"
-bash "$START" >>"$LOG" 2>&1
 for i in $(seq 1 30); do [ "$(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8080/api/system)" = 401 ] && break; sleep 2; done
 
 # ---------- checks -------------------------------------------------------------
@@ -410,7 +522,7 @@ cat <<EOF
 
 =============================================================================
  DONE. Panel: $PANEL_URL   (login: $ADMIN_EMAIL)
- After any restart run:   bash $START
+ $( [ "$SYSTEMD" = 1 ] && echo "Everything starts by itself after a reboot. To restart by hand: bash $START" || echo "After any restart run:   bash $START" )
  Saved answers and DB password: $CONF  (keep private)
 
  STILL TO DO BY HAND (panel pages):
