@@ -31,7 +31,7 @@ Some hosts give a web console instead. Open it from their dashboard; it works th
 Copy one line, paste it, press Enter:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/destinyjob2007-gif/LONER-VPS-INSTALLER/main/ptero-install.sh -o ptero-install.sh && bash ptero-install.sh
+curl -fsSL https://raw.githubusercontent.com/destinyjob2007-gif/LONER-VPS-INSTALLER-/main/ptero-install.sh -o ptero-install.sh && bash ptero-install.sh
 ```
 
 If `curl` is missing: `apt update && apt install -y curl`, then try again.
@@ -95,3 +95,16 @@ bash /data/start-ptero.sh
 ## Credits
 
 Made by **LONER**. Uses [Pterodactyl](https://pterodactyl.io), Docker and ngrok.
+
+
+## Something went wrong and you want to start again?
+
+Run the reset script. It wipes the panel, its database and every server inside it, then you run the installer again from the top.
+
+```
+curl -fsSL https://raw.githubusercontent.com/destinyjob2007-gif/LONER-VPS-INSTALLER-/main/ptero-reset.sh -o ptero-reset.sh && bash ptero-reset.sh
+```
+
+It asks you to type `RESET` first, so nothing is deleted by accident. PHP, nginx, MariaDB and Docker stay installed, so the second run is quicker.
+
+If the installer stopped half-way and you only want to continue (not wipe), just run the installer again: finished steps are skipped.
