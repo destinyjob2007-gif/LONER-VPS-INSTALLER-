@@ -1,6 +1,6 @@
 # LONER VPS INSTALLER
 
-Installs a full **Pterodactyl panel + Wings + Docker** on a fresh Ubuntu VPS in one run.
+Installs a full **Pterodactyl panel + Wings + Docker** on a fresh Ubuntu or Debian VPS in one run.
 It also sets up **ngrok**, so you get a public `https` address without buying a domain.
 Made for people who have never set up a server before.
 
@@ -8,7 +8,7 @@ Made for people who have never set up a server before.
 
 | Thing | Notes |
 |---|---|
-| A VPS | Ubuntu **22.04 or 24.04**, at least **2 GB RAM** (4 GB+ is better) and 20 GB disk |
+| A VPS | Ubuntu **22.04 or 24.04**, or Debian **11, 12 or 13** (normal servers with systemd, and container-style VMs without it), at least **2 GB RAM** (4 GB+ is better) and 20 GB disk |
 | Root access | You log in as `root` |
 | A way to reach the panel | Either a free ngrok account (no domain needed, the script walks you through it) **or** your own domain |
 | A terminal app | **Termux** or **ConnectBot** on Android, **Termius** on iPhone, or PuTTY / Windows Terminal on PC |
